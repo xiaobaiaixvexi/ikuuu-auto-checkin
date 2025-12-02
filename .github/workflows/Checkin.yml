@@ -1,46 +1,79 @@
-name: IKUUU-Auto-Checkin
+// checkin.js - 推荐保存到 https://raw.githubusercontent.com/你的用户名/仓库/main/checkin.js
+// 或者直接用我维护的这个：https://ghproxy.com/https://raw.githubusercontent.com/TW-Codes/ikuuu-auto-checkin/main/checkin.js
 
-on:
-  workflow_dispatch:
-  schedule:
-    # Actions 任务延迟过高，提前一些时间。
-    # UTC+8 ~ 07:33  33 23
-    - cron: "0 22 * * *"
+const accounts = JSON.parse(process.env.IKUUU_ACCOUNTS || "[]");
 
-jobs:
-  checkin:
-    name: Checkin
-    runs-on: ubuntu-latest
-    env:
-      ACCOUNTS: ${{ secrets.ACCOUNTS }}
-      HOST: ${{ secrets.HOST }}
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
+if (accounts.length === 0) {
+  console.log("未配置 IKUUU_ACCOUNTS");
+  process.exit(0);
+}
 
-    steps:
-      - uses: actions/checkout@v4
+const headers = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36",
+  "Referer": "https://ikuuu.de/",
+  "Origin": "https://ikuuu.de",
+  "Accept": "application/json, text/javascript, */*; q=0.01",
+  "X-Requested-With": "XMLHttpRequest",
+};
 
-      - name: Use Node.js latest
-        uses: actions/setup-node@v4
-        with:
-          node-version: latest
+for (const account of accounts) {
+  const host = account.host || "ikuuu.de"; // 支持自定义域名
+  const base = `https://${host}`;
 
-      - name: Checkin
-        id: checkin
-        shell: bash
-        run: |
-          node main.js
+  try {
+    // 1. 尝试直接使用长期 Cookie（expire_in）签到
+    const expire_in = account.expire_in || "";
+    let cookie = expire_in ? `expire_in=${expire_in}` : "";
 
-      - name: Notify
-        if: ${{ always() && env.TELEGRAM_TOKEN && env.TELEGRAM_TO }}
-        uses: appleboy/telegram-action@master
-        with:
-          to: ${{ secrets.TELEGRAM_TO }}
-          token: ${{ secrets.TELEGRAM_TOKEN }}
-          format: markdown
-          message: |
-            *iKuuu 自动签到*
+    let res = await fetch(`${base}/user/checkin`, {
+      method: "POST",
+      headers: { ...headers, cookie },
+    });
 
-            ${{ steps.checkin.outputs.result  }}
+    // 2. 如果返回未登录（ret:0），再走登录流程
+    if (!res.ok || (await res.json()).ret !== 1) {
+      console.log(`${account.name} Cookie 失效，重新登录...`);
 
-            [任务详情](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+      const loginForm = new FormData();
+      loginForm.append("email", account.email);
+      loginForm.append("passwd", account.passwd);
+      loginForm.append("code", "");
+      loginForm.append("remember_me", "on"); // 重要！开启记住登录
+
+      const loginRes = await fetch(`${base}/auth/login`, {
+        method: "POST",
+        headers,
+        body: loginForm,
+        redirect: "manual",
+      });
+
+      const cookies = loginRes.headers.raw()["set-cookie"] || [];
+      const expireMatch = cookies
+        .map((c) => c.match(/expire_in=([^;]+)/))
+        .find((m) => m);
+      if (!expireMatch) throw new Error("登录失败，未获取到 expire_in");
+
+      cookie = `expire_in=${expireMatch[1]}`;
+      console.log(`${account.name} 登录成功，更新 Cookie`);
+
+      // 重新签到
+      res = await fetch(`${base}/user/checkin`, {
+        method: "POST",
+        headers: { ...headers, cookie },
+      });
+    }
+
+    const data = await res.json();
+    console.log(`✅ \( {account.name}: \){data.msg}`);
+
+    // 可选：把新的 expire_in 打印出来，方便你手动更新 Secrets（提高下次命中率）
+    if (cookie.includes("expire_in=")) {
+      const newExpire = cookie.match(/expire_in=([^;]+)/)[1];
+      console.log(`   └─ 新 expire_in=${newExpire}`);
+    }
+  } catch (err) {
+    console.error(`❌ \( {account.name}: \){err.message}`);
+  }
+  console.log(""); // 空行分隔
+}
