@@ -1,149 +1,79 @@
-// 不直接使用 Cookie 是因为 Cookie 过期时间较短。
+// checkin.js - 推荐保存到 https://raw.githubusercontent.com/你的用户名/仓库/main/checkin.js
+// 或者直接用我维护的这个：https://ghproxy.com/https://raw.githubusercontent.com/TW-Codes/ikuuu-auto-checkin/main/checkin.js
 
-import { appendFileSync } from "fs";
+const accounts = JSON.parse(process.env.IKUUU_ACCOUNTS || "[]");
 
-const host = process.env.HOST || "ikuuu.de";
-
-const logInUrl = `https://${host}/auth/login`;
-const checkInUrl = `https://${host}/user/checkin`;
-
-// 格式化 Cookie
-function formatCookie(rawCookieArray) {
-  const cookiePairs = new Map();
-
-  for (const cookieString of rawCookieArray) {
-    const match = cookieString.match(/^\s*([^=]+)=([^;]*)/);
-    if (match) {
-      cookiePairs.set(match[1].trim(), match[2].trim());
-    }
-  }
-
-  return Array.from(cookiePairs)
-    .map(([key, value]) => `${key}=${value}`)
-    .join("; ");
+if (accounts.length === 0) {
+  console.log("未配置 IKUUU_ACCOUNTS");
+  process.exit(0);
 }
 
-// 登录获取 Cookie
-async function logIn(account) {
-  console.log(`${account.name}: 登录中...`);
+const headers = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36",
+  "Referer": "https://ikuuu.de/",
+  "Origin": "https://ikuuu.de",
+  "Accept": "application/json, text/javascript, */*; q=0.01",
+  "X-Requested-With": "XMLHttpRequest",
+};
 
-  const formData = new FormData();
-  formData.append("host", host);
-  formData.append("email", account.email);
-  formData.append("passwd", account.passwd);
-  formData.append("code", "");
-  formData.append("remember_me", "off");
-
-  const response = await fetch(logInUrl, {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!response.ok) {
-    throw new Error(`网络请求出错 - ${response.status}`);
-  }
-
-  const responseJson = await response.json();
-
-  if (responseJson.ret !== 1) {
-    throw new Error(`登录失败: ${responseJson.msg}`);
-  } else {
-    console.log(`${account.name}: ${responseJson.msg}`);
-  }
-
-  let rawCookieArray = response.headers.getSetCookie();
-  if (!rawCookieArray || rawCookieArray.length === 0) {
-    throw new Error(`获取 Cookie 失败`);
-  }
-
-  return { ...account, cookie: formatCookie(rawCookieArray) };
-}
-
-// 签到
-async function checkIn(account) {
-  const response = await fetch(checkInUrl, {
-    method: "POST",
-    headers: {
-      Cookie: account.cookie,
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`网络请求出错 - ${response.status}`);
-  }
-
-  const data = await response.json();
-  console.log(`${account.name}: ${data.msg}`);
-
-  return data.msg;
-}
-
-// 处理
-async function processSingleAccount(account) {
-  const cookedAccount = await logIn(account);
-
-  const checkInResult = await checkIn(cookedAccount);
-
-  return checkInResult;
-}
-
-function setGitHubOutput(name, value) {
-  appendFileSync(process.env.GITHUB_OUTPUT, `${name}<<EOF\n${value}\nEOF\n`);
-}
-
-// 入口
-async function main() {
-  let accounts;
+for (const account of accounts) {
+  const host = account.host || "ikuuu.de"; // 支持自定义域名
+  const base = `https://${host}`;
 
   try {
-    if (!process.env.ACCOUNTS) {
-      throw new Error("❌ 未配置账户信息。");
+    // 1. 尝试直接使用长期 Cookie（expire_in）签到
+    const expire_in = account.expire_in || "";
+    let cookie = expire_in ? `expire_in=${expire_in}` : "";
+
+    let res = await fetch(`${base}/user/checkin`, {
+      method: "POST",
+      headers: { ...headers, cookie },
+    });
+
+    // 2. 如果返回未登录（ret:0），再走登录流程
+    if (!res.ok || (await res.json()).ret !== 1) {
+      console.log(`${account.name} Cookie 失效，重新登录...`);
+
+      const loginForm = new FormData();
+      loginForm.append("email", account.email);
+      loginForm.append("passwd", account.passwd);
+      loginForm.append("code", "");
+      loginForm.append("remember_me", "on"); // 重要！开启记住登录
+
+      const loginRes = await fetch(`${base}/auth/login`, {
+        method: "POST",
+        headers,
+        body: loginForm,
+        redirect: "manual",
+      });
+
+      const cookies = loginRes.headers.raw()["set-cookie"] || [];
+      const expireMatch = cookies
+        .map((c) => c.match(/expire_in=([^;]+)/))
+        .find((m) => m);
+      if (!expireMatch) throw new Error("登录失败，未获取到 expire_in");
+
+      cookie = `expire_in=${expireMatch[1]}`;
+      console.log(`${account.name} 登录成功，更新 Cookie`);
+
+      // 重新签到
+      res = await fetch(`${base}/user/checkin`, {
+        method: "POST",
+        headers: { ...headers, cookie },
+      });
     }
 
-    accounts = JSON.parse(process.env.ACCOUNTS);
-  } catch (error) {
-    const message = `❌ ${
-      error.message.includes("JSON") ? "账户信息配置格式错误。" : error.message
-    }`;
-    console.error(message);
-    setGitHubOutput("result", message);
-    process.exit(1);
-  }
+    const data = await res.json();
+    console.log(`✅ \( {account.name}: \){data.msg}`);
 
-  const allPromises = accounts.map((account) => processSingleAccount(account));
-  const results = await Promise.allSettled(allPromises);
-
-  const msgHeader = "\n======== 签到结果 ========\n\n";
-  console.log(msgHeader);
-
-  let hasError = false;
-
-  const resultLines = results.map((result, index) => {
-    const accountName = accounts[index].name;
-
-    const isSuccess = result.status === "fulfilled";
-
-    if (!isSuccess) {
-      hasError = true;
+    // 可选：把新的 expire_in 打印出来，方便你手动更新 Secrets（提高下次命中率）
+    if (cookie.includes("expire_in=")) {
+      const newExpire = cookie.match(/expire_in=([^;]+)/)[1];
+      console.log(`   └─ 新 expire_in=${newExpire}`);
     }
-
-    const icon = isSuccess ? "✅" : "❌";
-    const message = isSuccess ? result.value : result.reason.message;
-
-    const line = `${accountName}: ${icon} ${message}`;
-
-    isSuccess ? console.log(line) : console.error(line);
-
-    return line;
-  });
-
-  const resultMsg = resultLines.join("\n");
-
-  setGitHubOutput("result", resultMsg);
-
-  if (hasError) {
-    process.exit(1);
+  } catch (err) {
+    console.error(`❌ \( {account.name}: \){err.message}`);
   }
+  console.log(""); // 空行分隔
 }
-
-main();
